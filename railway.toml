@@ -1,0 +1,6 @@
+[deploy]
+startCommand = "python pipeline.py"
+
+# Cron schedule: 7 PM ET daily on trading days (23:00 UTC covers EST and EDT)
+# Set this in the Railway dashboard when creating the service as type "Cron".
+# Schedule: 0 23 * * 1-5
