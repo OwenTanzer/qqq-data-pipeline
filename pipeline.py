@@ -591,14 +591,19 @@ def fetch_via_dxlink(today: date, auth: dict) -> list[dict]:
     """
     targets = target_expirations(today)
 
-    # Quick spot estimate for strike window (yfinance fast_info avoids a full download)
+    # Use the daily bar Close as the spot price — it is the 4PM official close.
+    # fast_info.last_price reflects after-hours trading when the pipeline runs at 5-6pm ET,
+    # so the daily OHLCV bar (regular session only) is the reliable source.
     try:
-        spot = float(yf.Ticker(TICKER).fast_info.last_price)
+        df_1d = yf.download(TICKER, period="1d", interval="1d", auto_adjust=True, progress=False)
+        if isinstance(df_1d.columns, pd.MultiIndex):
+            df_1d.columns = [c[0] for c in df_1d.columns]
+        spot = float(df_1d["Close"].iloc[-1])
         if math.isnan(spot):
             raise ValueError
     except Exception:
-        spot = float(yf.download(TICKER, period="1d", progress=False)["Close"].iloc[-1])
-    print(f"  spot ~ ${spot:.2f}")
+        spot = float(yf.Ticker(TICKER).fast_info.last_price)
+    print(f"  spot (4PM close) = ${spot:.2f}")
 
     chain_rows = load_chain_for_pipeline(auth["session_token"], today, targets, spot)
     if not chain_rows:
@@ -622,9 +627,8 @@ def fetch_via_dxlink(today: date, auth: dict) -> list[dict]:
     state = feed.get_state()
     feed.stop()
 
-    # Use the official close price as UnderlyingPrice so ATM is anchored to the close.
-    # DXLink bid/ask goes stale after 4pm; fast_info.last_price matches the official close.
-    underlying_price = spot  # spot was already fetched from fast_info.last_price above
+    # UnderlyingPrice = 4PM official close (daily bar Close fetched above as `spot`).
+    underlying_price = spot
 
     rows: list[dict] = []
     for r in chain_rows:
