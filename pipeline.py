@@ -23,7 +23,9 @@ from datetime import date, datetime, timedelta, timezone
 import boto3
 import pandas as pd
 import pandas_market_calendars as mcal
+import pytz
 import requests
+import yfinance as yf
 from botocore.client import Config
 
 # ── config ─────────────────────────────────────────────────────────────────────
@@ -143,6 +145,57 @@ def upload_df(r2, bucket: str, df: pd.DataFrame, key: str) -> None:
     df.to_csv(buf, index=False)
     buf.seek(0)
     r2.put_object(Bucket=bucket, Key=key, Body=buf.read(), ContentType="text/csv")
+
+
+def _r2_key_exists(r2, bucket: str, key: str) -> bool:
+    try:
+        r2.head_object(Bucket=bucket, Key=key)
+        return True
+    except Exception:
+        return False
+
+
+_ET = pytz.timezone("America/New_York")
+
+
+def fetch_intraday(d: date) -> pd.DataFrame | None:
+    """Fetch 10-min (fallback 5-min) OHLCV bars for QQQ on date d via yfinance.
+    Filters to regular market hours (09:30–15:59 ET). Returns None if unavailable."""
+    for interval in ("10m", "5m"):
+        try:
+            df = yf.download(
+                "QQQ",
+                start=d.isoformat(),
+                end=(d + timedelta(days=1)).isoformat(),
+                interval=interval,
+                auto_adjust=True,
+                progress=False,
+            )
+            if not df.empty:
+                break
+        except Exception:
+            continue
+    else:
+        return None
+
+    if isinstance(df.columns, pd.MultiIndex):
+        df.columns = [c[0] for c in df.columns]
+
+    if df.index.tz is None:
+        df.index = df.index.tz_localize("UTC")
+    df.index = df.index.tz_convert(_ET)
+    df = df.between_time("09:30", "15:59")
+    if df.empty:
+        return None
+
+    df = df.reset_index()
+    df.columns = [str(c).lower() for c in df.columns]
+    dt_col = next((c for c in df.columns if "datetime" in c), None)
+    if dt_col and dt_col != "datetime":
+        df = df.rename(columns={dt_col: "datetime"})
+    df["datetime"] = df["datetime"].astype(str)
+
+    return df[["datetime", "open", "high", "low", "close", "volume"]]
 
 
 # ── MarketData.app ─────────────────────────────────────────────────────────────
@@ -276,6 +329,19 @@ def main():
             upload_df(r2, bucket, df, key)
             newly_added.append(d.isoformat())
             print(f"{len(rows)} contracts  →  {key}")
+
+            exp_day = next_trading_day(d)
+            if exp_day <= today:
+                price_key = f"prices/qqq_intraday_{exp_day.strftime('%Y%m%d')}.csv"
+                if _r2_key_exists(r2, bucket, price_key):
+                    print(f"    intraday {exp_day}: already in R2")
+                else:
+                    price_df = fetch_intraday(exp_day)
+                    if price_df is not None:
+                        upload_df(r2, bucket, price_df, price_key)
+                        print(f"    intraday {exp_day}: {len(price_df)} bars  →  {price_key}")
+                    else:
+                        print(f"    intraday {exp_day}: no data from yfinance")
         except SessionNotClosedError as e:
             print(f"session not yet closed — skipping  ({e})")
         except RuntimeError as e:
