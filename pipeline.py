@@ -622,10 +622,9 @@ def fetch_via_dxlink(today: date, auth: dict) -> list[dict]:
     state = feed.get_state()
     feed.stop()
 
-    # Underlying price from QQQ quote (fall back to yfinance estimate)
-    qqq_s = state.get(TICKER, {})
-    b, a  = qqq_s.get("bid"), qqq_s.get("ask")
-    underlying_price = (b + a) / 2 if b is not None and a is not None else spot
+    # Use the official close price as UnderlyingPrice so ATM is anchored to the close.
+    # DXLink bid/ask goes stale after 4pm; fast_info.last_price matches the official close.
+    underlying_price = spot  # spot was already fetched from fast_info.last_price above
 
     rows: list[dict] = []
     for r in chain_rows:
@@ -700,19 +699,19 @@ def main():
         save_manifest(r2, bucket, manifest)
         print(f"  {len(rows)} contracts -> {key}")
 
-    # Intraday prices for the expiry day
-    exp_day   = next_trading_day(today)
-    price_key = f"prices/qqq_intraday_{exp_day.strftime('%Y%m%d')}.csv"
-    if exp_day <= today:
-        if _r2_key_exists(r2, bucket, price_key):
-            print(f"  intraday {exp_day}: already in R2")
+    # Intraday prices for today.
+    # Today's price series is the expiry-day panel for yesterday's chain (captured D-1, expiring D).
+    # Tomorrow's prices don't exist yet and are intentionally left blank in the viewer.
+    price_key = f"prices/qqq_intraday_{today.strftime('%Y%m%d')}.csv"
+    if _r2_key_exists(r2, bucket, price_key):
+        print(f"  intraday {today}: already in R2")
+    else:
+        price_df = fetch_intraday(today)
+        if price_df is not None:
+            upload_df(r2, bucket, price_df, price_key)
+            print(f"  intraday {today}: {len(price_df)} bars -> {price_key}")
         else:
-            price_df = fetch_intraday(exp_day)
-            if price_df is not None:
-                upload_df(r2, bucket, price_df, price_key)
-                print(f"  intraday {exp_day}: {len(price_df)} bars -> {price_key}")
-            else:
-                print(f"  intraday {exp_day}: no data from yfinance")
+            print(f"  intraday {today}: no data from yfinance")
 
 
 if __name__ == "__main__":
