@@ -4,3 +4,5 @@ pandas>=2.0
 pandas_market_calendars>=4.3
 yfinance>=0.2
 pytz>=2023.3
+websocket-client>=1.6
+pyotp>=2.9
