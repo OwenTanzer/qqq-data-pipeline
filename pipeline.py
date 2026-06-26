@@ -2,9 +2,17 @@
 """
 pipeline.py — Daily QQQ 0DTE options chain pull and Cloudflare R2 upload.
 
-Runs as a Railway cron job after market close. Fetches today's option chain
-via DXLink (tastytrade streamer), uploads the CSV, and updates manifest.json.
-Also fetches intraday price bars for today's expiry day via yfinance.
+Runs as two Railway cron jobs (same script, two schedules — see railway.toml):
+
+  Morning run (~7-8 AM ET, after OCC 6:30 AM settlement push):
+    Fetches today's option chain via DXLink. At this point dxFeed already holds
+    D-1 settlement OI (the game board entering expiry day D). Saves as
+    raw/qqq_chain_{D}.csv with TradeDate=D. Intraday prices skipped (market
+    hasn't opened yet — handled gracefully).
+
+  Evening run (~5-6 PM ET, after market close):
+    Chain already in R2 — skipped by idempotency check. Fetches completed
+    5-min OHLCV bars for today's session and uploads to prices/.
 
 Required environment variables (set in Railway):
     TASTY_LOGIN             Tastytrade username / email
@@ -591,9 +599,10 @@ def fetch_via_dxlink(today: date, auth: dict) -> list[dict]:
     """
     targets = target_expirations(today)
 
-    # Use the daily bar Close as the spot price — it is the 4PM official close.
-    # fast_info.last_price reflects after-hours trading when the pipeline runs at 5-6pm ET,
-    # so the daily OHLCV bar (regular session only) is the reliable source.
+    # Use the most recent completed daily bar Close as the spot price.
+    # Morning run: this is D-1's 4PM close — a reliable ATM proxy for centering
+    # the ±33 strike window (QQQ doesn't typically gap 33 points overnight).
+    # Evening run (if chain somehow wasn't captured in the morning): D's 4PM close.
     try:
         df_1d = yf.download(TICKER, period="1d", interval="1d", auto_adjust=True, progress=False)
         if isinstance(df_1d.columns, pd.MultiIndex):
@@ -703,9 +712,9 @@ def main():
         save_manifest(r2, bucket, manifest)
         print(f"  {len(rows)} contracts -> {key}")
 
-    # Intraday prices for today.
-    # Today's price series is the expiry-day panel for yesterday's chain (captured D-1, expiring D).
-    # Tomorrow's prices don't exist yet and are intentionally left blank in the viewer.
+    # Intraday prices for today's expiry day D.
+    # Morning run: market hasn't opened yet — fetch_intraday returns None, skipped gracefully.
+    # Evening run: full session bars available — uploads to prices/qqq_intraday_{D}.csv.
     price_key = f"prices/qqq_intraday_{today.strftime('%Y%m%d')}.csv"
     if _r2_key_exists(r2, bucket, price_key):
         print(f"  intraday {today}: already in R2")

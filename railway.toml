@@ -1,6 +1,15 @@
 [deploy]
 startCommand = "python pipeline.py"
 
-# Cron schedule: 7 PM ET daily on trading days (23:00 UTC covers EST and EDT)
-# Set this in the Railway dashboard when creating the service as type "Cron".
-# Schedule: 0 23 * * 1-5
+# Two Railway cron services are required (same command, different schedules):
+#
+#   Service 1 — "pipeline-chain" (morning):
+#     Schedule: 0 12 * * 1-5
+#     12:00 UTC = 7 AM EST / 8 AM EDT — always after the OCC 6:30 AM settlement
+#     push hits dxFeed. Captures D-1 settlement OI (the game board) for expiry day D.
+#     Chain already-in-R2 check skips on the evening run.
+#
+#   Service 2 — "pipeline-prices" (evening):
+#     Schedule: 0 22 * * 1-5
+#     22:00 UTC = 5 PM EST / 6 PM EDT — after market close.
+#     Chain already in R2 → skipped. Captures completed intraday price bars for D.
