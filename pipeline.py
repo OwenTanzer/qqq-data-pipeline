@@ -15,9 +15,9 @@ Runs as two Railway cron jobs (same script, two schedules — see railway.toml):
     5-min OHLCV bars for today's session and uploads to prices/.
 
 Required environment variables (set in Railway):
-    TASTY_LOGIN             Tastytrade username / email
-    TASTY_PASSWORD          Tastytrade password  (not needed if remember-token exists in R2)
-    TASTY_TOTP_SECRET       TOTP secret (base32) for 2FA -- optional if remember-token exists
+    TASTY_OAUTH_CLIENT_SECRET  tastytrade personal OAuth client secret
+    TASTY_OAUTH_REFRESH_TOKEN tastytrade personal OAuth refresh token
+    TASTY_OAUTH_SCOPES        must be exactly "read"
     R2_ACCOUNT_ID           Cloudflare account ID
     R2_ACCESS_KEY_ID        R2 API token key ID
     R2_SECRET_ACCESS_KEY    R2 API token secret
@@ -42,11 +42,12 @@ import websocket
 import yfinance as yf
 from botocore.client import Config
 
+from tasty_oauth import OAuthTokenManager, TASTY_BASE, bearer_headers, tasty_auth
+
 # -- config --------------------------------------------------------------------
 
 TICKER        = "QQQ"
 STRIKE_WINDOW = 33
-TASTY_BASE    = "https://api.tastyworks.com"
 DXLINK_WAIT   = 90   # max seconds to wait for OI data to populate
 
 _ET = pytz.timezone("America/New_York")
@@ -205,118 +206,6 @@ def fetch_intraday(d: date) -> pd.DataFrame | None:
     return df[["datetime", "open", "high", "low", "close", "volume"]]
 
 
-# -- tastytrade auth -----------------------------------------------------------
-
-R2_REMEMBER_TOKEN_KEY = "auth/remember_token.json"
-
-
-def _load_remember_token(r2, bucket: str) -> Optional[str]:
-    try:
-        body = r2.get_object(Bucket=bucket, Key=R2_REMEMBER_TOKEN_KEY)["Body"].read()
-        return json.loads(body)["remember_token"]
-    except Exception:
-        pass
-    return os.environ.get("TASTY_REMEMBER_TOKEN")
-
-
-def _save_remember_token(r2, bucket: str, token: str) -> None:
-    r2.put_object(
-        Bucket=bucket,
-        Key=R2_REMEMBER_TOKEN_KEY,
-        Body=json.dumps({"remember_token": token,
-                         "updated_at": datetime.now(timezone.utc).isoformat()}).encode(),
-        ContentType="application/json",
-    )
-    print("  remember-token rotated and saved to R2")
-
-
-def _complete_device_challenge(login: str, password: str, challenge_token: str) -> requests.Response:
-    import pyotp
-    requests.post(
-        f"{TASTY_BASE}/device-challenge",
-        headers={"Content-Type": "application/json",
-                 "X-Tastyworks-Challenge-Token": challenge_token},
-        timeout=10,
-    )
-    otp = pyotp.TOTP(os.environ["TASTY_TOTP_SECRET"]).now()
-    return requests.post(
-        f"{TASTY_BASE}/sessions",
-        json={"login": login, "password": password, "remember-me": True},
-        headers={
-            "Content-Type": "application/json",
-            "X-Tastyworks-Challenge-Token": challenge_token,
-            "X-Tastyworks-OTP": otp,
-        },
-        timeout=15,
-    )
-
-
-def tasty_auth(login: str, r2, bucket: str) -> dict:
-    remember_token = _load_remember_token(r2, bucket)
-    if remember_token:
-        print("  tasty_auth -- trying remember-token")
-        resp = requests.post(
-            f"{TASTY_BASE}/sessions",
-            json={"login": login, "remember-token": remember_token, "remember-me": True},
-            headers={"Content-Type": "application/json"},
-            timeout=15,
-        )
-        if resp.status_code == 201:
-            data      = resp.json()["data"]
-            new_token = data.get("remember-token")
-            if new_token:
-                _save_remember_token(r2, bucket, new_token)
-            resp2 = requests.get(
-                f"{TASTY_BASE}/api-quote-tokens",
-                headers={"Authorization": data["session-token"]},
-                timeout=10,
-            )
-            resp2.raise_for_status()
-            d = resp2.json()["data"]
-            return {
-                "session_token":  data["session-token"],
-                "streamer_token": d["token"],
-                "streamer_url":   (d.get("dxlink-url") or d.get("websocket-url") or
-                                   "wss://tasty-openapi-ws.dxfeed.com/realtime"),
-            }
-        print(f"  remember-token rejected ({resp.status_code}), falling back to password")
-
-    password = _require("TASTY_PASSWORD")
-    resp = requests.post(
-        f"{TASTY_BASE}/sessions",
-        json={"login": login, "password": password, "remember-me": True},
-        headers={"Content-Type": "application/json"},
-        timeout=15,
-    )
-    if resp.status_code == 403:
-        challenge_token = resp.headers.get("X-Tastyworks-Challenge-Token")
-        if not challenge_token:
-            resp.raise_for_status()
-        print("  device challenge -- completing with TOTP")
-        resp = _complete_device_challenge(login, password, challenge_token)
-
-    resp.raise_for_status()
-    data          = resp.json()["data"]
-    session_token = data["session-token"]
-    new_token     = data.get("remember-token")
-    if new_token:
-        _save_remember_token(r2, bucket, new_token)
-
-    resp2 = requests.get(
-        f"{TASTY_BASE}/api-quote-tokens",
-        headers={"Authorization": session_token},
-        timeout=10,
-    )
-    resp2.raise_for_status()
-    d = resp2.json()["data"]
-    return {
-        "session_token":  session_token,
-        "streamer_token": d["token"],
-        "streamer_url":   (d.get("dxlink-url") or d.get("websocket-url") or
-                           "wss://tasty-openapi-ws.dxfeed.com/realtime"),
-    }
-
-
 # -- option chain structure ----------------------------------------------------
 
 def _strike_str(strike: float) -> str:
@@ -343,7 +232,7 @@ def _build_symbol(strike: float, exp_date: str, option_type: str) -> str:
     return f".{TICKER}{yy}{mm}{dd}{side}{_strike_str(strike)}"
 
 
-def load_chain_for_pipeline(session_token: str, today: date,
+def load_chain_for_pipeline(access_token: str, today: date,
                              targets: list[tuple[str, date]], spot: float) -> list[dict]:
     """
     Load multi-expiry chain from tastytrade REST API.
@@ -351,7 +240,7 @@ def load_chain_for_pipeline(session_token: str, today: date,
     """
     resp = requests.get(
         f"{TASTY_BASE}/option-chains/{TICKER}/nested",
-        headers={"Authorization": session_token},
+        headers=bearer_headers(access_token),
         timeout=30,
     )
     resp.raise_for_status()
@@ -614,7 +503,7 @@ def fetch_via_dxlink(today: date, auth: dict) -> list[dict]:
         spot = float(yf.Ticker(TICKER).fast_info.last_price)
     print(f"  spot (4PM close) = ${spot:.2f}")
 
-    chain_rows = load_chain_for_pipeline(auth["session_token"], today, targets, spot)
+    chain_rows = load_chain_for_pipeline(auth["access_token"], today, targets, spot)
     if not chain_rows:
         raise RuntimeError("no chain rows returned from tastytrade chain API")
 
@@ -678,7 +567,6 @@ def fetch_via_dxlink(today: date, auth: dict) -> list[dict]:
 # -- main ----------------------------------------------------------------------
 
 def main():
-    login      = _require("TASTY_LOGIN")
     account_id = _require("R2_ACCOUNT_ID")
     key_id     = _require("R2_ACCESS_KEY_ID")
     secret     = _require("R2_SECRET_ACCESS_KEY")
@@ -700,7 +588,7 @@ def main():
         print(f"Chain for {today} already in R2 -- skipping chain fetch.")
     else:
         print(f"Fetching chain for {today} via DXLink ...")
-        auth = tasty_auth(login, r2, bucket)
+        auth = tasty_auth(OAuthTokenManager.from_env())
         rows = fetch_via_dxlink(today, auth)
         if not rows:
             print("No data returned -- aborting.")
