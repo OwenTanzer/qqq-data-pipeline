@@ -57,6 +57,7 @@ class R2Stub:
         self.etag = None
         self.version = 0
         self.writes = []
+        self.reads = 0
         self.conflicts = 0
         self.fail_reads_with = None
         self.before_write = None
@@ -70,6 +71,7 @@ class R2Stub:
         return {"ETag": self.etag}
 
     def get_object(self, Bucket, Key):  # noqa: N803
+        self.reads += 1
         if self.fail_reads_with is not None:
             raise self.fail_reads_with
         if self.document is None:
@@ -155,6 +157,74 @@ class ManifestMergeTests(unittest.TestCase):
         with self.assertRaises(ms.ManifestUnreadable):
             daily_write(stub, TODAY)
         self.assertEqual(stub.writes, [], "no write follows an unreadable document")
+
+    def test_conflict_shapes_are_all_recognised_and_retried(self):
+        """A lost precondition must be recognised however the client reports it.
+
+        R2's SDK path surfaces `Error.Code`, but boto3 also synthesises failures
+        from the HTTP status alone, and a client reset can leave only a
+        `.status` attribute. The classifier has three fallbacks; if any is
+        dropped the exception propagates as itself, the caller stops retrying
+        and the index write fails instead of merging.
+        """
+
+        class CodeOnly(Exception):
+            response = {"Error": {"Code": "PreconditionFailed"}}
+
+        class HttpStatusOnly(Exception):
+            response = {"ResponseMetadata": {"HTTPStatusCode": 412}}
+
+        class AttrStatusOnly(Exception):
+            status = 412
+
+        class AttrCodeOnly(Exception):
+            code = 409
+
+        class PlainConflict(Exception):
+            response = {"Error": {"Code": "ConditionalRequestConflict"}}
+
+        shapes = [
+            ("Error.Code PreconditionFailed", CodeOnly),
+            ("Error.Code ConditionalRequestConflict", PlainConflict),
+            ("ResponseMetadata 412", HttpStatusOnly),
+            ("status attribute 412", AttrStatusOnly),
+            ("code attribute 409", AttrCodeOnly),
+        ]
+        for label, factory in shapes:
+            stub = R2Stub({"dates": ["2026-11-10"], "weekly_expirations": {}})
+
+            def _raise(*_args, _factory=factory, **_kwargs):
+                raise _factory(f"injected {label}")
+
+            stub.put_object = _raise
+            with self.assertRaises(ms.ManifestConflict):
+                daily_write(stub, TODAY, sleeper=lambda _: None)
+            self.assertEqual(stub.reads, ms.MANIFEST_ATTEMPTS, label)
+
+        class ServerError(Exception):
+            response = {"Error": {"Code": "InternalError"}}
+
+        stub = R2Stub({"dates": ["2026-11-10"], "weekly_expirations": {}})
+
+        def _boom(*_args, **_kwargs):
+            raise ServerError("boom")
+
+        stub.put_object = _boom
+        with self.assertRaises(ServerError):
+            daily_write(stub, TODAY, sleeper=lambda _: None)
+        self.assertEqual(stub.reads, 1, "a 5xx gets exactly one attempt")
+
+    def test_protocol_constants_are_pinned(self):
+        """The two repositories keep this protocol as a copy, not an import.
+
+        A one-sided edit to the retry budget or the conflict set would be
+        invisible to the other repository's suite, so the values are asserted
+        here and in the collector's copy. Changing one without the other is then
+        a deliberate act with two failing tests, not a silent divergence.
+        """
+        self.assertEqual(ms.MANIFEST_ATTEMPTS, 5)
+        self.assertEqual(ms.MANIFEST_BACKOFF_BASE_SECS, 0.1)
+        self.assertEqual(ms.MANIFEST_BACKOFF_CAP_SECS, 1.1)
 
     def test_daily_then_weekly_preserves_the_new_date(self):
         stub = R2Stub({"dates": ["2026-11-10"], "weekly_expirations": {}})
