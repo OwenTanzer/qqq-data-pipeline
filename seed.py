@@ -23,6 +23,8 @@ import boto3
 import pandas as pd
 from botocore.client import Config
 
+from manifest_store import empty_manifest_seed, update_manifest
+
 
 def make_r2(account_id: str, key_id: str, secret: str):
     return boto3.client(
@@ -95,17 +97,20 @@ def main():
         print("Warning: no viewer-compatible OIranges.csv found — skipping.")
 
     # ── manifest ───────────────────────────────────────────────────────────────
-    manifest = {
-        "dates":      sorted(dates),
-        "updated_at": datetime.now(timezone.utc).isoformat(),
-    }
-    r2.put_object(
-        Bucket=bucket,
-        Key="manifest.json",
-        Body=json.dumps(manifest, indent=2).encode(),
-        ContentType="application/json",
-    )
-    print(f"\nmanifest.json written — {len(dates)} dates.")
+    # Union into the existing index rather than replacing it. The collector
+    # owns `weekly_expirations` in this same object, and a reseed must not drop
+    # it, the published `note`, or any date this local directory does not
+    # happen to contain. A compare-and-swap write keeps a concurrent collector
+    # write from being lost in exchange.
+    def merge_seeded_dates(document: dict) -> dict:
+        existing = set(document.get("dates") or [])
+        document["dates"] = sorted(existing | dates)
+        document["updated_at"] = datetime.now(timezone.utc).isoformat()
+        return document
+
+    merged = update_manifest(r2, merge_seeded_dates, bucket, seed=empty_manifest_seed())
+    print(f"\nmanifest.json written — {len(merged['dates'])} dates "
+          f"({len(dates)} from this directory).")
     print("Bucket seeded successfully.")
 
 

@@ -42,6 +42,8 @@ import websocket
 import yfinance as yf
 from botocore.client import Config
 
+from manifest_store import (ManifestConflict, ManifestDamaged, ManifestUnreadable,
+                              add_date, empty_manifest_seed, read_manifest, update_manifest)
 from tasty_oauth import OAuthTokenManager, TASTY_BASE, bearer_headers, tasty_auth
 
 # -- config --------------------------------------------------------------------
@@ -135,20 +137,29 @@ def make_r2(account_id: str, key_id: str, secret: str):
 
 
 def load_manifest(r2, bucket: str) -> dict:
-    try:
-        obj = r2.get_object(Bucket=bucket, Key="manifest.json")
-        return json.loads(obj["Body"].read().decode())
-    except Exception:
-        return {"dates": []}
+    """Read the shared index; absence is a first run, a failure is not empty.
+
+    Returning `{"dates": []}` for *any* exception was the worst defect in this
+    pair of writers: a timeout or a 5xx was then written back over the real
+    document, deleting the whole date index, the `note` and every weekly
+    reference in one request. `read_manifest` raises `ManifestUnreadable`
+    instead, and the run aborts rather than publishing an empty index.
+    """
+    document, _etag = read_manifest(r2, bucket)
+    return document if document is not None else empty_manifest_seed()
 
 
-def save_manifest(r2, bucket: str, manifest: dict) -> None:
-    manifest["updated_at"] = datetime.now(timezone.utc).isoformat()
-    r2.put_object(
-        Bucket=bucket,
-        Key="manifest.json",
-        Body=json.dumps(manifest, indent=2, sort_keys=True).encode(),
-        ContentType="application/json",
+def save_manifest(r2, bucket: str, date_str: str) -> dict:
+    """Union one trading day into `dates` with a compare-and-swap write.
+
+    Re-reads inside the retry loop, so a weekly index that lands between this
+    run's read and its write costs one retry, not the collector's field.
+    """
+    return update_manifest(
+        r2,
+        lambda document: add_date(document, date_str),
+        bucket,
+        seed=empty_manifest_seed(),
     )
 
 
@@ -596,8 +607,7 @@ def main():
         df  = pd.DataFrame(rows)
         key = f"raw/qqq_chain_{today.strftime('%Y%m%d')}.csv"
         upload_df(r2, bucket, df, key)
-        manifest["dates"] = sorted(existing | {today.isoformat()})
-        save_manifest(r2, bucket, manifest)
+        save_manifest(r2, bucket, today.isoformat())
         print(f"  {len(rows)} contracts -> {key}")
 
     # Intraday prices for today's expiry day D.
