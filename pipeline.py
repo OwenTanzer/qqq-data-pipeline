@@ -353,7 +353,7 @@ class DXLinkSnapshot:
 
     def wait_for_oi(self, symbols: list[str], timeout: float = DXLINK_WAIT) -> bool:
         """Return True once at least half of the subscribed symbols have OI data."""
-        threshold = max(1, len(symbols) // 2)
+        threshold = max(1, (len(symbols) + 1) // 2)
         deadline  = time.monotonic() + timeout
         while time.monotonic() < deadline:
             with self._lock:
@@ -495,6 +495,18 @@ class DXLinkSnapshot:
 
 # -- fetch today's chain -------------------------------------------------------
 
+def previous_close(session: date) -> float:
+    bars = yf.download(TICKER, start=session.isoformat(),
+                       end=(session + timedelta(days=1)).isoformat(),
+                       interval="1d", auto_adjust=False, progress=False)
+    if isinstance(bars.columns, pd.MultiIndex):
+        bars.columns = bars.columns.get_level_values(0)
+    prices = bars.loc[bars.index.date == session, "Close"]
+    if len(prices) != 1 or not math.isfinite(float(prices.iloc[0])) or prices.iloc[0] <= 0:
+        raise RuntimeError(f"Missing valid daily close for {session}")
+    return float(prices.iloc[0])
+
+
 def fetch_via_dxlink(today: date, auth: dict) -> list[dict]:
     """
     Connect to DXLink, subscribe to today's 6-tier option chain, wait for
@@ -502,20 +514,9 @@ def fetch_via_dxlink(today: date, auth: dict) -> list[dict]:
     """
     targets = target_expirations(today)
 
-    # Use the most recent completed daily bar Close as the spot price.
-    # Morning run: this is D-1's 4PM close — a reliable ATM proxy for centering
-    # the ±33 strike window (QQQ doesn't typically gap 33 points overnight).
-    # Evening run (if chain somehow wasn't captured in the morning): D's 4PM close.
-    try:
-        df_1d = yf.download(TICKER, period="1d", interval="1d", auto_adjust=True, progress=False)
-        if isinstance(df_1d.columns, pd.MultiIndex):
-            df_1d.columns = [c[0] for c in df_1d.columns]
-        spot = float(df_1d["Close"].iloc[-1])
-        if math.isnan(spot):
-            raise ValueError
-    except Exception:
-        spot = float(yf.Ticker(TICKER).fast_info.last_price)
-    print(f"  spot (4PM close) = ${spot:.2f}")
+    prior = prior_trading_day(today - timedelta(days=1))
+    spot = previous_close(prior)
+    print(f"  spot ({prior} close) = ${spot:.2f}")
 
     chain_rows = load_chain_for_pipeline(auth["access_token"], today, targets, spot)
     if not chain_rows:
@@ -534,10 +535,12 @@ def fetch_via_dxlink(today: date, auth: dict) -> list[dict]:
         raise RuntimeError("DXLink did not become ready within 30s")
 
     print(f"  waiting up to {DXLINK_WAIT}s for OI data ...")
-    feed.wait_for_oi(all_opt_syms)
-
-    state = feed.get_state()
-    feed.stop()
+    try:
+        if not feed.wait_for_oi(all_opt_syms):
+            raise RuntimeError("Insufficient morning open-interest coverage")
+        state = feed.get_state()
+    finally:
+        feed.stop()
 
     # UnderlyingPrice = 4PM official close (daily bar Close fetched above as `spot`).
     underlying_price = spot
@@ -559,7 +562,7 @@ def fetch_via_dxlink(today: date, auth: dict) -> list[dict]:
                 "Type":            side,
                 "OptionSymbol":    occ or sym,
                 "DTE":             dte,
-                "OpenInterest":    s.get("oi", 0),
+                "OpenInterest":    s.get("oi"),
                 "Volume":          s.get("volume", 0),
                 "Bid":             bid,
                 "Mid":             mid,
@@ -623,7 +626,7 @@ def main():
         finished = datetime.now(_ET)
         if finished.date() != today or (finished.hour, finished.minute) >= (9, 30):
             raise RuntimeError("Chain capture crossed market open")
-        if not rows or not any(row.get("OpenInterest") for row in rows):
+        if not rows or not any(row.get("OpenInterest") is not None for row in rows):
             raise RuntimeError("Morning feed returned no usable open interest")
         df  = pd.DataFrame(rows)
         key = f"raw/qqq_chain_{today.strftime('%Y%m%d')}.csv"
