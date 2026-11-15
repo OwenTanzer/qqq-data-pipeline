@@ -41,6 +41,7 @@ import requests
 import websocket
 import yfinance as yf
 from botocore.client import Config
+from botocore.exceptions import ClientError
 
 from manifest_store import (ManifestConflict, ManifestDamaged, ManifestUnreadable,
                               add_date, empty_manifest_seed, read_manifest, update_manifest)
@@ -167,15 +168,17 @@ def upload_df(r2, bucket: str, df: pd.DataFrame, key: str) -> None:
     buf = io.BytesIO()
     df.to_csv(buf, index=False)
     buf.seek(0)
-    r2.put_object(Bucket=bucket, Key=key, Body=buf.read(), ContentType="text/csv")
+    r2.put_object(Bucket=bucket, Key=key, Body=buf.read(), ContentType="text/csv", IfNoneMatch="*")
 
 
 def _r2_key_exists(r2, bucket: str, key: str) -> bool:
     try:
         r2.head_object(Bucket=bucket, Key=key)
         return True
-    except Exception:
-        return False
+    except ClientError as exc:
+        if exc.response["Error"]["Code"] in {"404", "NoSuchKey", "NotFound"}:
+            return False
+        raise
 
 
 # -- intraday prices (yfinance) ------------------------------------------------
@@ -583,7 +586,17 @@ def main():
     secret     = _require("R2_SECRET_ACCESS_KEY")
     bucket     = _require("R2_BUCKET_NAME")
 
-    today = date.today()
+    print(f"Pipeline runtime boto3={boto3.__version__}", flush=True)
+    now = datetime.now(_ET)
+    today = now.date()
+    service = _require("RAILWAY_SERVICE_NAME")
+    if service not in {"qqq-data-pipeline", "qqq-prices-pipeline"}:
+        raise RuntimeError("Unknown scheduled pipeline service")
+    morning = service == "qqq-data-pipeline"
+    minutes = now.hour * 60 + now.minute
+    if (morning and not 390 <= minutes < 570) or (not morning and minutes < 960):
+        print("Outside this service's collection window; skipping.")
+        return
     _load_calendar(today - timedelta(days=10), today + timedelta(days=120))
 
     if not is_trading_day(today):
@@ -594,6 +607,12 @@ def main():
     manifest = load_manifest(r2, bucket)
     existing = set(manifest.get("dates", []))
 
+    chain_key = f"raw/qqq_chain_{today.strftime('%Y%m%d')}.csv"
+    chain_exists = _r2_key_exists(r2, bucket, chain_key)
+    if not morning and (not chain_exists or today.isoformat() not in existing):
+        raise RuntimeError("Evening prices require the morning chain and manifest entry")
+    if morning and chain_exists != (today.isoformat() in existing):
+        raise RuntimeError("Chain and manifest disagree; preserve the archive for reconciliation")
     # Chain collection
     if today.isoformat() in existing:
         print(f"Chain for {today} already in R2 -- skipping chain fetch.")
@@ -601,14 +620,19 @@ def main():
         print(f"Fetching chain for {today} via DXLink ...")
         auth = tasty_auth(OAuthTokenManager.from_env())
         rows = fetch_via_dxlink(today, auth)
-        if not rows:
-            print("No data returned -- aborting.")
-            return
+        finished = datetime.now(_ET)
+        if finished.date() != today or (finished.hour, finished.minute) >= (9, 30):
+            raise RuntimeError("Chain capture crossed market open")
+        if not rows or not any(row.get("OpenInterest") for row in rows):
+            raise RuntimeError("Morning feed returned no usable open interest")
         df  = pd.DataFrame(rows)
         key = f"raw/qqq_chain_{today.strftime('%Y%m%d')}.csv"
         upload_df(r2, bucket, df, key)
         save_manifest(r2, bucket, today.isoformat())
         print(f"  {len(rows)} contracts -> {key}")
+
+    if morning:
+        return
 
     # Intraday prices for today's expiry day D.
     # Morning run: market hasn't opened yet — fetch_intraday returns None, skipped gracefully.
