@@ -41,6 +41,7 @@ import requests
 import websocket
 import yfinance as yf
 from botocore.client import Config
+from botocore.exceptions import ClientError
 
 from manifest_store import (ManifestConflict, ManifestDamaged, ManifestUnreadable,
                               add_date, empty_manifest_seed, read_manifest, update_manifest)
@@ -167,15 +168,17 @@ def upload_df(r2, bucket: str, df: pd.DataFrame, key: str) -> None:
     buf = io.BytesIO()
     df.to_csv(buf, index=False)
     buf.seek(0)
-    r2.put_object(Bucket=bucket, Key=key, Body=buf.read(), ContentType="text/csv")
+    r2.put_object(Bucket=bucket, Key=key, Body=buf.read(), ContentType="text/csv", IfNoneMatch="*")
 
 
 def _r2_key_exists(r2, bucket: str, key: str) -> bool:
     try:
         r2.head_object(Bucket=bucket, Key=key)
         return True
-    except Exception:
-        return False
+    except ClientError as exc:
+        if exc.response["Error"]["Code"] in {"404", "NoSuchKey", "NotFound"}:
+            return False
+        raise
 
 
 # -- intraday prices (yfinance) ------------------------------------------------
@@ -350,7 +353,7 @@ class DXLinkSnapshot:
 
     def wait_for_oi(self, symbols: list[str], timeout: float = DXLINK_WAIT) -> bool:
         """Return True once at least half of the subscribed symbols have OI data."""
-        threshold = max(1, len(symbols) // 2)
+        threshold = max(1, (len(symbols) + 1) // 2)
         deadline  = time.monotonic() + timeout
         while time.monotonic() < deadline:
             with self._lock:
@@ -492,6 +495,18 @@ class DXLinkSnapshot:
 
 # -- fetch today's chain -------------------------------------------------------
 
+def previous_close(session: date) -> float:
+    bars = yf.download(TICKER, start=session.isoformat(),
+                       end=(session + timedelta(days=1)).isoformat(),
+                       interval="1d", auto_adjust=False, progress=False)
+    if isinstance(bars.columns, pd.MultiIndex):
+        bars.columns = bars.columns.get_level_values(0)
+    prices = bars.loc[bars.index.date == session, "Close"]
+    if len(prices) != 1 or not math.isfinite(float(prices.iloc[0])) or prices.iloc[0] <= 0:
+        raise RuntimeError(f"Missing valid daily close for {session}")
+    return float(prices.iloc[0])
+
+
 def fetch_via_dxlink(today: date, auth: dict) -> list[dict]:
     """
     Connect to DXLink, subscribe to today's 6-tier option chain, wait for
@@ -499,20 +514,9 @@ def fetch_via_dxlink(today: date, auth: dict) -> list[dict]:
     """
     targets = target_expirations(today)
 
-    # Use the most recent completed daily bar Close as the spot price.
-    # Morning run: this is D-1's 4PM close — a reliable ATM proxy for centering
-    # the ±33 strike window (QQQ doesn't typically gap 33 points overnight).
-    # Evening run (if chain somehow wasn't captured in the morning): D's 4PM close.
-    try:
-        df_1d = yf.download(TICKER, period="1d", interval="1d", auto_adjust=True, progress=False)
-        if isinstance(df_1d.columns, pd.MultiIndex):
-            df_1d.columns = [c[0] for c in df_1d.columns]
-        spot = float(df_1d["Close"].iloc[-1])
-        if math.isnan(spot):
-            raise ValueError
-    except Exception:
-        spot = float(yf.Ticker(TICKER).fast_info.last_price)
-    print(f"  spot (4PM close) = ${spot:.2f}")
+    prior = prior_trading_day(today - timedelta(days=1))
+    spot = previous_close(prior)
+    print(f"  spot ({prior} close) = ${spot:.2f}")
 
     chain_rows = load_chain_for_pipeline(auth["access_token"], today, targets, spot)
     if not chain_rows:
@@ -531,10 +535,12 @@ def fetch_via_dxlink(today: date, auth: dict) -> list[dict]:
         raise RuntimeError("DXLink did not become ready within 30s")
 
     print(f"  waiting up to {DXLINK_WAIT}s for OI data ...")
-    feed.wait_for_oi(all_opt_syms)
-
-    state = feed.get_state()
-    feed.stop()
+    try:
+        if not feed.wait_for_oi(all_opt_syms):
+            raise RuntimeError("Insufficient morning open-interest coverage")
+        state = feed.get_state()
+    finally:
+        feed.stop()
 
     # UnderlyingPrice = 4PM official close (daily bar Close fetched above as `spot`).
     underlying_price = spot
@@ -556,7 +562,7 @@ def fetch_via_dxlink(today: date, auth: dict) -> list[dict]:
                 "Type":            side,
                 "OptionSymbol":    occ or sym,
                 "DTE":             dte,
-                "OpenInterest":    s.get("oi", 0),
+                "OpenInterest":    s.get("oi"),
                 "Volume":          s.get("volume", 0),
                 "Bid":             bid,
                 "Mid":             mid,
@@ -583,7 +589,17 @@ def main():
     secret     = _require("R2_SECRET_ACCESS_KEY")
     bucket     = _require("R2_BUCKET_NAME")
 
-    today = date.today()
+    print(f"Pipeline runtime boto3={boto3.__version__}", flush=True)
+    now = datetime.now(_ET)
+    today = now.date()
+    service = _require("RAILWAY_SERVICE_NAME")
+    if service not in {"qqq-data-pipeline", "qqq-prices-pipeline"}:
+        raise RuntimeError("Unknown scheduled pipeline service")
+    morning = service == "qqq-data-pipeline"
+    minutes = now.hour * 60 + now.minute
+    if (morning and not 390 <= minutes < 570) or (not morning and minutes < 960):
+        print("Outside this service's collection window; skipping.")
+        return
     _load_calendar(today - timedelta(days=10), today + timedelta(days=120))
 
     if not is_trading_day(today):
@@ -594,6 +610,12 @@ def main():
     manifest = load_manifest(r2, bucket)
     existing = set(manifest.get("dates", []))
 
+    chain_key = f"raw/qqq_chain_{today.strftime('%Y%m%d')}.csv"
+    chain_exists = _r2_key_exists(r2, bucket, chain_key)
+    if not morning and (not chain_exists or today.isoformat() not in existing):
+        raise RuntimeError("Evening prices require the morning chain and manifest entry")
+    if morning and chain_exists != (today.isoformat() in existing):
+        raise RuntimeError("Chain and manifest disagree; preserve the archive for reconciliation")
     # Chain collection
     if today.isoformat() in existing:
         print(f"Chain for {today} already in R2 -- skipping chain fetch.")
@@ -601,14 +623,19 @@ def main():
         print(f"Fetching chain for {today} via DXLink ...")
         auth = tasty_auth(OAuthTokenManager.from_env())
         rows = fetch_via_dxlink(today, auth)
-        if not rows:
-            print("No data returned -- aborting.")
-            return
+        finished = datetime.now(_ET)
+        if finished.date() != today or (finished.hour, finished.minute) >= (9, 30):
+            raise RuntimeError("Chain capture crossed market open")
+        if not rows or not any(row.get("OpenInterest") is not None for row in rows):
+            raise RuntimeError("Morning feed returned no usable open interest")
         df  = pd.DataFrame(rows)
         key = f"raw/qqq_chain_{today.strftime('%Y%m%d')}.csv"
         upload_df(r2, bucket, df, key)
         save_manifest(r2, bucket, today.isoformat())
         print(f"  {len(rows)} contracts -> {key}")
+
+    if morning:
+        return
 
     # Intraday prices for today's expiry day D.
     # Morning run: market hasn't opened yet — fetch_intraday returns None, skipped gracefully.
